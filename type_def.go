@@ -20,7 +20,8 @@ type Mover struct {
 	MaxQueueSize          uint // default 1000
 	MultiPartChunkSizeMB  uint // default 64
 	S3Client              s3iface.S3API
-	Logger                interface { // If you want logs, provide a logger. We aren't going to force you.
+	// If you want logs, provide a logger. We aren't going to force you.
+	Logger interface {
 		Printf(format string, v ...interface{})
 	}
 

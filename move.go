@@ -9,11 +9,17 @@ import (
 	"github.com/aws/aws-sdk-go/service/s3/s3iface"
 )
 
+type uploadProperties struct {
+	uploadID string
+	numParts int64
+	objSize  int64
+}
+
 // if errors are returned from this function no action is required.
 func (m *Mover) requestGenerator(
 	returnChan chan response,
 	sourceBucket, sourceKey, destBucket, destKey string,
-) (uploadID string, numParts int64, err error) {
+) (up uploadProperties, err error) {
 	// Stat the object to make sure its there and get its size
 	obj, err := m.s3Client().ListObjectsV2(&s3.ListObjectsV2Input{
 		Bucket: &sourceBucket,
@@ -40,11 +46,11 @@ func (m *Mover) requestGenerator(
 	}
 	// N.B !! Any errors returned below this need to have the mpu aborted !
 
-	uploadID = *mpu.UploadId
+	uploadID := *mpu.UploadId
 	m.Logger.Printf("uploadID: %s", uploadID)
 
 	chunkSize := int64(m.MultiPartChunkSizeMB << 20)
-	numParts = objSize/chunkSize + 1 // ceil
+	numParts := objSize/chunkSize + 1 // ceil
 	m.Logger.Printf("number of parts: %d", numParts)
 
 	var i int64 // itteration count not part number
@@ -56,7 +62,7 @@ func (m *Mover) requestGenerator(
 			high = objSize - 1
 		}
 		byteRange := fmt.Sprintf("bytes=%d-%d", low, high)
-		m.Logger.Printf("part %d, sends range: %s", i+1, byteRange)
+		//m.Logger.Printf("part %d, sends range: %s", i+1, byteRange)
 
 		m.partUploadQueue <- request{
 			input: &s3.UploadPartCopyInput{
@@ -74,7 +80,7 @@ func (m *Mover) requestGenerator(
 	}
 	m.Logger.Printf("All requests sent")
 
-	return
+	return uploadProperties{uploadID, numParts, objSize}, err
 }
 
 func (m Mover) finalise(uploadID string, numParts int64, responses <-chan response) ([]*s3.CompletedPart, error) {
@@ -83,13 +89,13 @@ func (m Mover) finalise(uploadID string, numParts int64, responses <-chan respon
 
 	var processed int64
 	for job := range responses {
-		m.Logger.Printf("received response: part %d\n", *job.partNumber)
+		//m.Logger.Printf("received response: part %d\n", *job.partNumber)
 		if job.err != nil {
 			m.Logger.Printf("finaliser error! job: %s. %v", job.output.GoString(), job.err)
 			return parts, job.err
 		}
 		processed++
-		m.Logger.Printf("processed part number %d in response %d", *job.partNumber, processed)
+		//m.Logger.Printf("processed part number %d in response %d", *job.partNumber, processed)
 		parts[*job.partNumber-1] = &s3.CompletedPart{
 			ETag:       job.output.CopyPartResult.ETag,
 			PartNumber: job.partNumber,
@@ -108,13 +114,15 @@ func (m Mover) finalise(uploadID string, numParts int64, responses <-chan respon
 // called on a Mover instatiated with your limits set.  Two Move operations on the same Mover will
 // share the set resources.  This is much more efficient than moving two items in series.
 func (m Mover) Move(sourceBucket, sourceKey, destBucket, destKey string) error {
+	startTime := time.Now()
+
 	// Create a done queue to return finished requests on
 	partDoneQueue := make(chan response)
 	defer close(partDoneQueue)
-	m.Logger.Printf("done queue made")
+	//m.Logger.Printf("done queue made")
 
 	// Create the multipart upload and generate all the requests
-	uploadID, numParts, err := m.requestGenerator(partDoneQueue, sourceBucket, sourceKey, destBucket, destKey)
+	mpuProps, err := m.requestGenerator(partDoneQueue, sourceBucket, sourceKey, destBucket, destKey)
 	if err != nil {
 		// MPU never started so no need to abort
 		return err
@@ -122,14 +130,24 @@ func (m Mover) Move(sourceBucket, sourceKey, destBucket, destKey string) error {
 	m.Logger.Printf("requests generated")
 
 	// Check Responses
-	completedParts, err := m.finalise(uploadID, numParts, partDoneQueue)
+	completedParts, err := m.finalise(mpuProps.uploadID, mpuProps.numParts, partDoneQueue)
 	if err != nil {
-		return abortMPU(m.s3Client(), destBucket, destKey, uploadID)
+		return abortMPU(m.s3Client(), destBucket, destKey, mpuProps.uploadID)
 	}
 	m.Logger.Printf("responses verified")
 
 	// CompleteMultipartUpload
-	return completeMPU(m.s3Client(), destBucket, destKey, uploadID, completedParts)
+	err = completeMPU(m.s3Client(), destBucket, destKey, mpuProps.uploadID, completedParts)
+
+	// Report stats
+	d := time.Since(startTime)
+	m.Logger.Printf("s3://%s/%s → s3://%s/%s move complete. Size=%s, Time=%v, Rate=%s/s",
+		sourceBucket, sourceKey,
+		destBucket, destKey,
+		byteSize(mpuProps.objSize), d.Round(time.Second), byteSize(float64(mpuProps.objSize)/d.Seconds()),
+	)
+
+	return err
 }
 
 func completeMPU(s3Client s3iface.S3API, bucket, key, uploadID string, completedParts []*s3.CompletedPart) error {
