@@ -2,7 +2,6 @@ package s3tos3
 
 import (
 	"os"
-	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
@@ -19,30 +18,21 @@ import (
 // should be used for all move operation.  Creating 2 instances of the transferer and configuring
 // both to have 100 concurrent requests will result in a total of 200 concurrent requests.
 type Mover struct {
-	MaxConcurrentRequests uint // default 600
-	MaxQueueSize          uint // default 3000
-	MultiPartChunkSizeMB  uint // default 64
-	S3Client              s3iface.S3API
+	Tick                 time.Duration
+	RequestQueueSize     uint
+	MultiPartChunkSizeMB uint // default 64
+	S3Client             s3iface.S3API
 	// If you want logs, provide a logger. We aren't going to force you.
 	Logger interface {
 		Printf(format string, v ...interface{})
 	}
 
-	// private
+	// internal
 	partUploadQueue chan request
-	js              jobStats
+	uploaderDone    chan bool
+	saveStats       chan uploadProperties // for individual move ops send results in
+	aggregatedStats chan []uploadProperties
 	startTime       time.Time
-}
-
-type jobStats struct {
-	*sync.Mutex
-	jobs []uploadProperties
-}
-
-func (js *jobStats) Add(up uploadProperties) {
-	js.Lock()
-	js.jobs = append(js.jobs, up)
-	js.Unlock()
 }
 
 // unLogger fulfills the logging interface but does nothing.
@@ -61,24 +51,20 @@ type response struct {
 	err        error
 }
 
-// Start starts the mover with default values in preparation for one or many Move operations.
+// Start initialises the mover and prepares for one or many Move operations.
 func (m *Mover) Start() {
 	// Initialise the Mover
 	m.startTime = time.Now()
-	m.js = jobStats{
-		Mutex: &sync.Mutex{},
-		jobs:  []uploadProperties{},
-	}
 
 	// Set sensible defaults.
-	if m.MaxConcurrentRequests == 0 {
-		m.MaxConcurrentRequests = 2
-	}
-	if m.MaxQueueSize == 0 {
-		m.MaxQueueSize = 1e3
-	}
 	if m.MultiPartChunkSizeMB == 0 {
-		m.MultiPartChunkSizeMB = 16
+		m.MultiPartChunkSizeMB = 64
+	}
+	if m.Tick == 0 {
+		m.Tick = 10 * time.Millisecond
+	}
+	if m.RequestQueueSize == 0 {
+		m.RequestQueueSize = 1e3
 	}
 
 	if m.Logger == nil {
@@ -96,58 +82,66 @@ func (m *Mover) Start() {
 		m.S3Client = s3.New(session.Must(session.NewSession(&aws.Config{Region: &region})))
 	}
 
-	// Create a job queue for ALL moving files.
-	m.partUploadQueue = make(chan request, m.MaxQueueSize) // closed by Stop
+	// Start a collector to store job results
+	m.saveStats = make(chan uploadProperties)
+	m.aggregatedStats = make(chan []uploadProperties)
+	go aggregateStats(m.saveStats, m.aggregatedStats)
 
 	// Start the sender that reads from the partUploadQueue. Errors are delt with by the sender.
+	// Create a job queue for ALL moving files.
+	m.partUploadQueue = make(chan request, m.RequestQueueSize) // closed by Stop
+	m.uploaderDone = make(chan bool)
 	go m.startWorkerPool()
 }
 
 // Stop must be called on a Started Mover to ensure resources are released.
 func (m *Mover) Stop() {
-	close(m.partUploadQueue)
 	d := time.Since(m.startTime)
 
+	// stop running queues and the goroutines processing them
+	close(m.partUploadQueue)
+	<-m.uploaderDone
+	close(m.saveStats)
+	stats := <-m.aggregatedStats
+
+	m.Logger.Printf("stats saver is done. Reading job stats ...")
 	var totalSize byteSize
-	for _, job := range m.js.jobs {
+	for _, job := range stats {
 		totalSize += byteSize(job.objSize)
 	}
 
 	m.Logger.Printf("Mover Stopped. %d jobs (%s) completed in %s. Cummulative rate of %s/s",
-		len(m.js.jobs), totalSize, d.Round(time.Second), totalSize/byteSize(d.Seconds()),
+		len(stats), totalSize, d.Round(time.Second), totalSize/byteSize(d.Seconds()),
 	)
 }
 
 // startWorkerPool schedules part copy operations to maximise but not exceed the configured
 // specifications.
-func (m *Mover) startWorkerPool() {
-	// If the workers have to wait to get their failed job back on the queue then they will be
-	// useless until they can.  Let this goroutine do the waiting for them while they continue on.
-	var replayChannel = make(chan request) // Unbuffered to unblock workers
-	go func() {
-		for failedJob := range replayChannel {
-			m.partUploadQueue <- failedJob
-		}
-	}()
+func (m Mover) startWorkerPool() {
+	throttle := m.scheduler(m.Tick, 2*time.Second)
+	defer throttle.Stop()
 
-	for i := 0; i < int(m.MaxConcurrentRequests); i++ {
-		go func() {
-			for job := range m.partUploadQueue {
-				// TODO: Impliment a scheduler
-				//m.Logger.Printf("Pulled job, Waiting for %v", cycleTime+pause)
-				time.Sleep(time.Millisecond) // basic reducer for now
-
-				result, err := m.S3Client.UploadPartCopy(job.input)
-				// if throttling, backoff otherwise pass through and let the move op
-				// deal with it.
-				if aerr, ok := err.(awserr.Error); ok && aerr.Code() == "RequestError" {
-					// TODO: Exp. backoff but cap at 1s
-					//m.Logger.Printf("RequestError: backing off request interval to %s", cycleTime)
-					replayChannel <- job
-					continue
-				}
-				job.done <- response{result, job.input.PartNumber, err}
+	for job := range m.partUploadQueue {
+		<-throttle.C
+		go func(job request) {
+			result, err := m.S3Client.UploadPartCopy(job.input)
+			// if error due to request rate, backoff. Otherwise pass through and let the move op
+			// deal with it.
+			if aerr, ok := err.(awserr.Error); ok && aerr.Code() == "RequestError" {
+				throttle.Inc <- true
+				m.partUploadQueue <- job
+				return
 			}
-		}()
+			job.done <- response{result, job.input.PartNumber, err}
+		}(job)
 	}
+	m.uploaderDone <- true
+}
+
+func aggregateStats(in chan uploadProperties, out chan []uploadProperties) {
+	var results []uploadProperties
+	for s := range in {
+		results = append(results, s)
+	}
+	out <- results
 }

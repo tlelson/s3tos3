@@ -11,6 +11,12 @@ import (
 	"github.com/tlelson/s3tos3"
 )
 
+type logger struct{}
+
+func (logger) Printf(format string, v ...interface{}) {
+	log.Printf(format, v...)
+}
+
 // Error should call Abort
 
 // What happens for small files?!
@@ -20,7 +26,7 @@ func Test_Move(t *testing.T) {
 	mover := s3tos3.Mover{
 		MultiPartChunkSizeMB: 5,
 		S3Client:             &mS3,
-		Logger:               &log.Logger{},
+		Logger:               logger{},
 	}
 
 	var expectedParts int64 = 3
