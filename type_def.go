@@ -11,6 +11,10 @@ import (
 	"github.com/aws/aws-sdk-go/service/s3/s3iface"
 )
 
+type logger interface {
+	Printf(format string, v ...interface{})
+}
+
 // Mover configures an instance of the s3tos3 mover.  Multiple moves may be called on the same
 // instance to ensure that local resources are not used beyond those configured.
 //
@@ -18,14 +22,12 @@ import (
 // should be used for all move operation.  Creating 2 instances of the transferer and configuring
 // both to have 100 concurrent requests will result in a total of 200 concurrent requests.
 type Mover struct {
-	Tick                 time.Duration
-	RequestQueueSize     uint
-	MultiPartChunkSizeMB uint // default 64
+	Tick                 time.Duration // nano
+	MultiPartChunkSizeMB uint          // default 64
+	Preload              uint          // default 0
 	S3Client             s3iface.S3API
 	// If you want logs, provide a logger. We aren't going to force you.
-	Logger interface {
-		Printf(format string, v ...interface{})
-	}
+	Logger logger
 
 	// internal
 	partUploadQueue chan request
@@ -61,10 +63,7 @@ func (m *Mover) Start() {
 		m.MultiPartChunkSizeMB = 64
 	}
 	if m.Tick == 0 {
-		m.Tick = 10 * time.Millisecond
-	}
-	if m.RequestQueueSize == 0 {
-		m.RequestQueueSize = 1e3
+		m.Tick = time.Nanosecond
 	}
 
 	if m.Logger == nil {
@@ -89,7 +88,7 @@ func (m *Mover) Start() {
 
 	// Start the sender that reads from the partUploadQueue. Errors are delt with by the sender.
 	// Create a job queue for ALL moving files.
-	m.partUploadQueue = make(chan request, m.RequestQueueSize) // closed by Stop
+	m.partUploadQueue = make(chan request)
 	m.uploaderDone = make(chan bool)
 	go m.startWorkerPool()
 }
@@ -98,9 +97,13 @@ func (m *Mover) Start() {
 func (m *Mover) Stop() {
 	d := time.Since(m.startTime)
 
-	// stop running queues and the goroutines processing them
+	// Stop running queues and the goroutines processing them
+	// To panic or not to panic?
+	// The following panics If Stop called before all Move ops complete.
 	close(m.partUploadQueue)
 	<-m.uploaderDone
+
+	// Read and Report on Job statistics
 	close(m.saveStats)
 	stats := <-m.aggregatedStats
 
@@ -118,18 +121,22 @@ func (m *Mover) Stop() {
 // startWorkerPool schedules part copy operations to maximise but not exceed the configured
 // specifications.
 func (m Mover) startWorkerPool() {
-	throttle := m.scheduler(m.Tick, 2*time.Second)
+	throttle := scheduler(m.Tick, time.Second, m.Preload, m.Logger)
 	defer throttle.Stop()
+
+	// Consider taking partUploads from Move operations and delaying them so that we failed items
+	// have a chance to get back into the queue without blocking a lot of the following goroutines.
 
 	for job := range m.partUploadQueue {
 		<-throttle.C
 		go func(job request) {
+			// TODO: Impliment a timeout ? Looks like request is just being dropped by AWS
 			result, err := m.S3Client.UploadPartCopy(job.input)
 			// if error due to request rate, backoff. Otherwise pass through and let the move op
 			// deal with it.
 			if aerr, ok := err.(awserr.Error); ok && aerr.Code() == "RequestError" {
 				throttle.Inc <- true
-				m.partUploadQueue <- job
+				m.partUploadQueue <- job // blocks
 				return
 			}
 			job.done <- response{result, job.input.PartNumber, err}

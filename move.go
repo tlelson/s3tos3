@@ -86,11 +86,19 @@ func (m Mover) finalise(uploadID string, numParts int64, responses <-chan respon
 	var parts = make([]*s3.CompletedPart, numParts)
 
 	var processed int64
+	// TODO: Consider changing to enforce a timeout that prints the number of part aggregated every
+	// 5 seconds
 	for job := range responses {
 		if job.err != nil {
 			return parts, job.err
 		}
 		processed++
+
+		// Temp logging
+		if processed%10 == 0 {
+			fmt.Printf("%s - items processed %d\n", uploadID[:4], processed)
+		}
+
 		parts[*job.partNumber-1] = &s3.CompletedPart{
 			ETag:       job.output.CopyPartResult.ETag,
 			PartNumber: job.partNumber,
@@ -111,8 +119,9 @@ func (m Mover) Move(sourceBucket, sourceKey, destBucket, destKey string) error {
 	startTime := time.Now()
 
 	// Create a done queue to return finished requests on
+	// TODO, consider buffering this channel so that shedulers are unblocked. Would need to work out
+	// object size first.
 	partDoneQueue := make(chan response)
-	defer close(partDoneQueue)
 
 	// Create the multipart upload and generate all the requests
 	props, err := m.requestGenerator(partDoneQueue, sourceBucket, sourceKey, destBucket, destKey)

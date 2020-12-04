@@ -18,9 +18,10 @@ type adjustableTicker struct {
 	stop chan bool
 }
 
-// scheduler returns an Adjustable Ticker that may be used as a throttler implimenting
-// Exponential backoff.  If a failure is detected, the detector can send a call to the incrimenting
-// channel to increase the tick interval
+// TODO: make own package. Rename to New
+// scheduler returns an Adjustable Ticker that may be used as a throttler implimenting Exponential
+// backoff.  If a failure is detected, the detector can send a call to the incrimenting channel to
+// increase the tick interval
 //
 // The initial tick period is set with the input variable d. When incGlobb is non-zero, all requests
 // to incriment the tick interval within that period are globbed to prevent radical runnaway of the
@@ -29,27 +30,27 @@ type adjustableTicker struct {
 // E.g: Suppose 10 go routines all timeout in the same 1 second period and they all send a call to
 // incriment the ticker from the same timeout event. Using incGlob of 1 second means that the first
 // is received and all other sends to incriment the ticker in the next second are discarded.
-func (m *Mover) scheduler(d, incGlob time.Duration) *adjustableTicker {
-	ticks := make(chan time.Time, 1) // Don't allow the ticker to prepopulate the queue
+func scheduler(d, incGlob time.Duration, preload uint, l logger) *adjustableTicker {
+	ticks := make(chan time.Time, preload)
 	inc := make(chan bool)
 
-	at := &adjustableTicker{C: ticks, Inc: inc, Logger: m.Logger}
+	at := &adjustableTicker{C: ticks, Inc: inc, Logger: l}
 	at.stop = at.startTimer(d, incGlob)
 	return at
 }
 
-func (t *adjustableTicker) startTimer(d, incGlob time.Duration) (stop chan bool) {
-	stop = make(chan bool, 1)
+func (t *adjustableTicker) startTimer(d, incGlob time.Duration) (quit chan bool) {
+	quit = make(chan bool) // unbuffered so that sender can rely on it being read
 	go func() {
 		for {
 			select {
-			case <-stop:
+			case <-quit:
 				return
 			case <-t.Inc:
 				// No more ticks get sent until the current failures are dropped
 				stop := t.drain(t.Inc)
 				time.Sleep(incGlob)
-				stop <- true
+				stop <- true // blocks until drain complete
 				d <<= 1
 				t.Logger.Printf("Increasing tick period to: %s", d)
 			default:
@@ -59,11 +60,11 @@ func (t *adjustableTicker) startTimer(d, incGlob time.Duration) (stop chan bool)
 			t.C <- time.Now()
 		}
 	}()
-	return stop
+	return quit
 }
 
 func (t adjustableTicker) drain(read chan bool) (quit chan bool) {
-	quit = make(chan bool, 1)
+	quit = make(chan bool)
 	go func() {
 		var globbed int
 		for {
@@ -85,4 +86,6 @@ func (t adjustableTicker) drain(read chan bool) (quit chan bool) {
 // reading from the channel from seeing an erroneous "tick".
 func (t *adjustableTicker) Stop() {
 	t.stop <- true
+	close(t.C)
+	close(t.Inc)
 }
