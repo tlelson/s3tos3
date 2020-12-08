@@ -19,8 +19,6 @@ func (logger) Printf(format string, v ...interface{}) {
 
 // Error should call Abort
 
-// What happens for small files?!
-
 func Test_Move(t *testing.T) {
 	mS3 := newMockS3(11 << 20) // 11 MiB
 	mover := s3tos3.Mover{

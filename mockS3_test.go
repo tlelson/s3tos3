@@ -1,10 +1,12 @@
 package s3tos3_test
 
 import (
+	"context"
 	"crypto/rand"
 	"fmt"
 	"sync"
 
+	"github.com/aws/aws-sdk-go/aws/request"
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/aws/aws-sdk-go/service/s3/s3iface"
 )
@@ -44,7 +46,9 @@ func (s mockS3) ListParts(*s3.ListPartsInput) (*s3.ListPartsOutput, error) {
 }
 
 // Try without pointer
-func (s mockS3) UploadPartCopy(in *s3.UploadPartCopyInput) (*s3.UploadPartCopyOutput, error) {
+func (s mockS3) UploadPartCopyWithContext(
+	_ context.Context, in *s3.UploadPartCopyInput, _ ...request.Option,
+) (*s3.UploadPartCopyOutput, error) {
 	// Store this for later checking
 	s.partRanges.Add(*in.PartNumber, *in.CopySourceRange)
 

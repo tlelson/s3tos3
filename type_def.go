@@ -1,6 +1,7 @@
 package s3tos3
 
 import (
+	"context"
 	"os"
 	"time"
 
@@ -9,6 +10,8 @@ import (
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/aws/aws-sdk-go/service/s3/s3iface"
+
+	"github.com/tlelson/s3tos3/adjustableticker"
 )
 
 type logger interface {
@@ -16,18 +19,17 @@ type logger interface {
 }
 
 // Mover configures an instance of the s3tos3 mover.  Multiple moves may be called on the same
-// instance to ensure that local resources are not used beyond those configured.
+// instance to maximise throughput by reducing conflict over resources.
 //
-// For example. If you only want 100 concurrent requests but have 5 files to move, the same instance
-// should be used for all move operation.  Creating 2 instances of the transferer and configuring
-// both to have 100 concurrent requests will result in a total of 200 concurrent requests.
+// None of the parameters are required.
 type Mover struct {
-	Tick                 time.Duration // nano
-	MultiPartChunkSizeMB uint          // default 64
-	Preload              uint          // default 0
-	S3Client             s3iface.S3API
-	// If you want logs, provide a logger. We aren't going to force you.
-	Logger logger
+	RequestTimeout       time.Duration // Default 10s
+	Tick                 time.Duration // Default 8μs
+	QueueSize            uint          // Default 0
+	MultiPartChunkSizeMB uint          // Default 64
+	Preload              uint          // Default 0
+	S3Client             s3iface.S3API // If provided, will be reused.
+	Logger               logger        // If provided, will log output.
 
 	// internal
 	partUploadQueue chan request
@@ -43,6 +45,7 @@ type unLogger struct{}
 func (unLogger) Printf(string, ...interface{}) {}
 
 type request struct {
+	ctx   context.Context
 	input *s3.UploadPartCopyInput
 	done  chan response
 }
@@ -63,7 +66,10 @@ func (m *Mover) Start() {
 		m.MultiPartChunkSizeMB = 64
 	}
 	if m.Tick == 0 {
-		m.Tick = time.Nanosecond
+		m.Tick = 8 * time.Millisecond
+	}
+	if m.RequestTimeout == 0 {
+		m.RequestTimeout = 10 * time.Second
 	}
 
 	if m.Logger == nil {
@@ -86,19 +92,19 @@ func (m *Mover) Start() {
 	m.aggregatedStats = make(chan []uploadProperties)
 	go aggregateStats(m.saveStats, m.aggregatedStats)
 
-	// Start the sender that reads from the partUploadQueue. Errors are delt with by the sender.
-	// Create a job queue for ALL moving files.
-	m.partUploadQueue = make(chan request)
+	// Start the request sender that reads from the partUploadQueue and makes throttled HTTP
+	// requests.
+	m.partUploadQueue = make(chan request, m.QueueSize)
 	m.uploaderDone = make(chan bool)
 	go m.startWorkerPool()
 }
 
-// Stop must be called on a Started Mover to ensure resources are released.
+// Stop must be called on a Started Mover to ensure resources are released. Only successful move
+// opperations are reported by logs.
 func (m *Mover) Stop() {
 	d := time.Since(m.startTime)
 
 	// Stop running queues and the goroutines processing them
-	// To panic or not to panic?
 	// The following panics If Stop called before all Move ops complete.
 	close(m.partUploadQueue)
 	<-m.uploaderDone
@@ -107,7 +113,7 @@ func (m *Mover) Stop() {
 	close(m.saveStats)
 	stats := <-m.aggregatedStats
 
-	m.Logger.Printf("stats saver is done. Reading job stats ...")
+	// Only using total Size at this time
 	var totalSize byteSize
 	for _, job := range stats {
 		totalSize += byteSize(job.objSize)
@@ -121,23 +127,38 @@ func (m *Mover) Stop() {
 // startWorkerPool schedules part copy operations to maximise but not exceed the configured
 // specifications.
 func (m Mover) startWorkerPool() {
-	throttle := scheduler(m.Tick, time.Second, m.Preload, m.Logger)
+	throttle := adjustableticker.Ticker{
+		Period: m.Tick,
+		Logger: m.Logger,
+	}
+	throttle.Start()
 	defer throttle.Stop()
-
-	// Consider taking partUploads from Move operations and delaying them so that we failed items
-	// have a chance to get back into the queue without blocking a lot of the following goroutines.
 
 	for job := range m.partUploadQueue {
 		<-throttle.C
 		go func(job request) {
-			// TODO: Impliment a timeout ? Looks like request is just being dropped by AWS
-			result, err := m.S3Client.UploadPartCopy(job.input)
-			// if error due to request rate, backoff. Otherwise pass through and let the move op
-			// deal with it.
-			if aerr, ok := err.(awserr.Error); ok && aerr.Code() == "RequestError" {
-				throttle.Inc <- true
-				m.partUploadQueue <- job // blocks
+			// If Job has been aborted. Don't send this request.
+			select {
+			case <-job.ctx.Done():
+				m.Logger.Printf("%s - context cancelled", (*job.input.UploadId)[:4])
 				return
+			default:
+				// otherwise proceed
+			}
+
+			// Set a timeout.
+			ctx, cancel := context.WithTimeout(job.ctx, m.RequestTimeout)
+			defer cancel()
+
+			result, err := m.S3Client.UploadPartCopyWithContext(ctx, job.input)
+			// Errors due to S3 throttling will be retried
+			if aerr, ok := err.(awserr.Error); ok {
+				switch aerr.Code() {
+				case "RequestError", "RequestCanceled":
+					throttle.Inc <- time.Now() // Ticks are too close, incriment it.
+					m.partUploadQueue <- job
+					return
+				}
 			}
 			job.done <- response{result, job.input.PartNumber, err}
 		}(job)

@@ -1,6 +1,7 @@
 package s3tos3
 
 import (
+	"context"
 	"fmt"
 	"time"
 
@@ -14,27 +15,36 @@ type uploadProperties struct {
 	numParts int64
 	objSize  int64
 	duration time.Duration
+	ctx      context.Context
+}
+
+// TODO: Buggy!  What if there is a key `key1` and another key `key1-second`.  Need to have a better
+// filter.
+func objectSize(s3Client s3iface.S3API, bucket, key string) (int64, error) {
+	// Stat the object to make sure its there and get its size
+	obj, err := s3Client.ListObjectsV2(&s3.ListObjectsV2Input{
+		Bucket: &bucket,
+		Prefix: &key,
+	})
+	if err != nil {
+		return 0, err
+	}
+	if len(obj.Contents) != 1 {
+		return 0, fmt.Errorf("listing object returned %v items", len(obj.Contents))
+	}
+	return *obj.Contents[0].Size, nil
 }
 
 // if errors are returned from this function no action is required.
-func (m Mover) requestGenerator(
+func (m Mover) generateRequests(
+	ctx context.Context,
 	returnChan chan response,
 	sourceBucket, sourceKey, destBucket, destKey string,
 ) (up uploadProperties, err error) {
-	// Stat the object to make sure its there and get its size
-	obj, err := m.S3Client.ListObjectsV2(&s3.ListObjectsV2Input{
-		Bucket: &sourceBucket,
-		Prefix: &sourceKey,
-	})
+	objSize, err := objectSize(m.S3Client, sourceBucket, sourceKey)
 	if err != nil {
 		return
 	}
-	if len(obj.Contents) != 1 {
-		err = fmt.Errorf("listing object returned %v items", len(obj.Contents))
-		return
-	}
-	objSize := *obj.Contents[0].Size
-	// If smaller than MaxChunkSize its fine, it just takes one request is all
 
 	// Register the MPU
 	mpu, err := m.S3Client.CreateMultipartUpload(&s3.CreateMultipartUploadInput{
@@ -55,7 +65,7 @@ func (m Mover) requestGenerator(
 	m.Logger.Printf("%s - number of parts: %d", uploadID[:4], numParts)
 
 	var i int64 // itteration count not part number
-	for ; i < numParts; i++ {
+	for i = 0; i < numParts; i++ {
 		// Set byte range
 		low := i * chunkSize
 		high := (i+1)*chunkSize - 1
@@ -76,28 +86,23 @@ func (m Mover) requestGenerator(
 				CopySourceRange: &byteRange,
 			},
 			done: returnChan,
+			ctx:  ctx,
 		}
 	}
 
-	return uploadProperties{uploadID: uploadID, numParts: numParts, objSize: objSize}, err
+	return uploadProperties{uploadID, numParts, objSize, 0, ctx}, err
 }
 
 func (m Mover) finalise(uploadID string, numParts int64, responses <-chan response) ([]*s3.CompletedPart, error) {
 	var parts = make([]*s3.CompletedPart, numParts)
-
 	var processed int64
-	// TODO: Consider changing to enforce a timeout that prints the number of part aggregated every
-	// 5 seconds
+
 	for job := range responses {
 		if job.err != nil {
+			// Un-recoverable error, needs attention
 			return parts, job.err
 		}
 		processed++
-
-		// Temp logging
-		if processed%10 == 0 {
-			fmt.Printf("%s - items processed %d\n", uploadID[:4], processed)
-		}
 
 		parts[*job.partNumber-1] = &s3.CompletedPart{
 			ETag:       job.output.CopyPartResult.ETag,
@@ -123,13 +128,19 @@ func (m Mover) Move(sourceBucket, sourceKey, destBucket, destKey string) error {
 	// object size first.
 	partDoneQueue := make(chan response)
 
+	ctx, cancelMove := context.WithCancel(context.Background())
+	defer cancelMove()
 	// Create the multipart upload and generate all the requests
-	props, err := m.requestGenerator(partDoneQueue, sourceBucket, sourceKey, destBucket, destKey)
+	props, err := m.generateRequests(ctx, partDoneQueue, sourceBucket, sourceKey, destBucket, destKey)
 	if err != nil {
 		// MPU never started so no need to abort
 		return err
 	}
 	m.Logger.Printf("%s - requests generated", props.uploadID[:4])
+
+	// N.B it would be possible to start the finaliser before the request generator is finished but
+	// the improvements in speed would be to the detriment of the readability of the Move procedure.
+	// Additionally, using a largish buffer on the request queue would achieve similar results.
 
 	// Check Responses
 	m.Logger.Printf("%s - finaliser starting, looking for %d parts ...", props.uploadID[:4], props.numParts)
@@ -160,10 +171,10 @@ func (m Mover) Move(sourceBucket, sourceKey, destBucket, destKey string) error {
 }
 
 // completeMPU attempts to complete the MultiPart Upload 4 times using exponential backoff after
-// each failed attempt.
-// This may be nessisary if the sender has gotten our HTTP session throttled or dropped by the
-// server.
-// If the 4 attempts fail, the final error is returned.
+// each failed attempt.  This may be necessary if the sender has gotten our HTTP session throttled
+// or dropped by the server.  If the 4th attempts fail, the final error is returned.
+// An alternate strategy might be to send this request to a queue and have the Mover do them all
+// when Stop is called. This would mean they are not trying to compete for network resources.
 func completeMPU(s3Client s3iface.S3API, bucket, key, uploadID string, completedParts []*s3.CompletedPart) error {
 	var err error
 	for i := 1; i <= 4; i++ {
@@ -183,7 +194,8 @@ func completeMPU(s3Client s3iface.S3API, bucket, key, uploadID string, completed
 }
 
 // Attempts to abort 4 times with exponential backoff after each failed attempt.  If the 4 attempts
-// fail, the final error is returned.
+// fail, the final error is returned.  As for completing the MPU, it may make sense to send these
+// request to the Mover to have them done when Stop is called.
 func abortMPU(s3Client s3iface.S3API, bucket, key, uploadID string) error {
 	var partsInTransit int
 	var err error
