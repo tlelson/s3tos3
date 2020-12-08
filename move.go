@@ -1,3 +1,9 @@
+// Package s3tos3 abstracts away the lower level S3 operations required to move files between two S3
+// locations.
+//
+// The problem is not bound by memory or CPU but rather S3 API limits and AWS specifications on how
+// the files must be copied. In theory files can be copied as fast as S3 servers can read and
+// execute our requests.
 package s3tos3
 
 import (
@@ -5,7 +11,6 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/aws/aws-sdk-go/service/s3/s3iface"
 )
@@ -63,6 +68,7 @@ func (m Mover) generateRequests(
 	chunkSize := int64(m.MultiPartChunkSizeMB << 20)
 	numParts := objSize/chunkSize + 1 // ceil
 	m.Logger.Printf("%s - number of parts: %d", uploadID[:4], numParts)
+	copySource := fmt.Sprintf("/%s/%s", sourceBucket, sourceKey)
 
 	var i int64 // itteration count not part number
 	for i = 0; i < numParts; i++ {
@@ -73,16 +79,17 @@ func (m Mover) generateRequests(
 			high = objSize - 1
 		}
 		byteRange := fmt.Sprintf("bytes=%d-%d", low, high)
+		partNumber := i + 1
 
 		m.partUploadQueue <- request{
 			input: &s3.UploadPartCopyInput{
 				// Unchanged for item
 				UploadId:   mpu.UploadId,
-				CopySource: aws.String(fmt.Sprintf("/%s/%s", sourceBucket, sourceKey)),
+				CopySource: &copySource,
 				Bucket:     &destBucket,
 				Key:        &destKey,
 				// Part specifications
-				PartNumber:      aws.Int64(i + 1),
+				PartNumber:      &partNumber,
 				CopySourceRange: &byteRange,
 			},
 			done: returnChan,
@@ -117,8 +124,8 @@ func (m Mover) finalise(uploadID string, numParts int64, responses <-chan respon
 	return parts, fmt.Errorf("response channel closed unexpectedly")
 }
 
-// Move transfers one s3 file to another s3 location.  It blocks until complete.  It should be
-// called on a Mover instatiated with your limits set.  Two Move operations on the same Mover will
+// Move transfers one S3 file to another S3 location.  It blocks until complete.  It should be
+// called on a Mover instantiated with your limits set.  Two Move operations on the same Mover will
 // share the set resources.  This is much more efficient than moving two items in series.
 func (m Mover) Move(sourceBucket, sourceKey, destBucket, destKey string) error {
 	startTime := time.Now()
@@ -170,7 +177,7 @@ func (m Mover) Move(sourceBucket, sourceKey, destBucket, destKey string) error {
 	return err
 }
 
-// completeMPU attempts to complete the MultiPart Upload 4 times using exponential backoff after
+// completeMPU attempts to complete the Multi-Part Upload 4 times using exponential back-off after
 // each failed attempt.  This may be necessary if the sender has gotten our HTTP session throttled
 // or dropped by the server.  If the 4th attempts fail, the final error is returned.
 // An alternate strategy might be to send this request to a queue and have the Mover do them all
@@ -193,7 +200,7 @@ func completeMPU(s3Client s3iface.S3API, bucket, key, uploadID string, completed
 		uploadID[:4], err)
 }
 
-// Attempts to abort 4 times with exponential backoff after each failed attempt.  If the 4 attempts
+// Attempts to abort 4 times with exponential back-off after each failed attempt.  If the 4 attempts
 // fail, the final error is returned.  As for completing the MPU, it may make sense to send these
 // request to the Mover to have them done when Stop is called.
 func abortMPU(s3Client s3iface.S3API, bucket, key, uploadID string) error {

@@ -1,3 +1,5 @@
+// Package adjustableticker provides standard ticker behavior but with the ability to adjust the
+// tick interval during the process.
 package adjustableticker
 
 import (
