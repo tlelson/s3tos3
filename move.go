@@ -82,6 +82,7 @@ func (m Mover) generateRequests(
 		partNumber := i + 1
 
 		m.partUploadQueue <- request{
+			requester: m.S3Client.UploadPartCopyWithContext,
 			input: &s3.UploadPartCopyInput{
 				// Unchanged for item
 				UploadId:   mpu.UploadId,
@@ -111,8 +112,13 @@ func (m Mover) finalise(uploadID string, numParts int64, responses <-chan respon
 		}
 		processed++
 
+		result, ok := job.output.(*s3.UploadPartCopyOutput)
+		if !ok {
+			return parts, fmt.Errorf("Couldn't convert job output to UploadPartCopyOutput")
+		}
+
 		parts[*job.partNumber-1] = &s3.CompletedPart{
-			ETag:       job.output.CopyPartResult.ETag,
+			ETag:       result.CopyPartResult.ETag,
 			PartNumber: job.partNumber,
 		}
 

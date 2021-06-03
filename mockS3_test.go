@@ -45,7 +45,6 @@ func (s mockS3) ListParts(*s3.ListPartsInput) (*s3.ListPartsOutput, error) {
 	return &s3.ListPartsOutput{}, nil
 }
 
-// Try without pointer
 func (s mockS3) UploadPartCopyWithContext(
 	_ context.Context, in *s3.UploadPartCopyInput, _ ...request.Option,
 ) (*s3.UploadPartCopyOutput, error) {

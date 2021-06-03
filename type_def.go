@@ -45,13 +45,16 @@ type unLogger struct{}
 func (unLogger) Printf(string, ...interface{}) {}
 
 type request struct {
-	ctx   context.Context
-	input *s3.UploadPartCopyInput
-	done  chan response
+	ctx context.Context
+	//input     *s3.UploadPartCopyInput
+	input     interface{}
+	done      chan response
+	requester func(_ context.Context, requestParams interface{}, dumped ...interface{}) (interface{}, error)
 }
 
 type response struct {
-	output     *s3.UploadPartCopyOutput
+	//output *s3.UploadPartCopyOutput
+	output     interface{}
 	partNumber *int64
 	err        error
 }
@@ -140,7 +143,7 @@ func (m Mover) startWorkerPool() {
 			// If Job has been aborted. Don't send this request.
 			select {
 			case <-job.ctx.Done():
-				m.Logger.Printf("%s - context cancelled", (*job.input.UploadId)[:4])
+				m.Logger.Printf("%s - context cancelled", (*job.input.(*s3.UploadPartCopyInput).UploadId)[:4])
 				return
 			default:
 				// otherwise proceed
@@ -150,7 +153,8 @@ func (m Mover) startWorkerPool() {
 			ctx, cancel := context.WithTimeout(job.ctx, m.RequestTimeout)
 			defer cancel()
 
-			result, err := m.S3Client.UploadPartCopyWithContext(ctx, job.input)
+			//result, err := m.S3Client.UploadPartCopyWithContext(ctx, job.input)
+			result, err := job.requester(ctx, job.input)
 			// Errors due to S3 throttling will be retried
 			if aerr, ok := err.(awserr.Error); ok {
 				switch aerr.Code() {
@@ -160,7 +164,9 @@ func (m Mover) startWorkerPool() {
 					return
 				}
 			}
-			job.done <- response{result, job.input.PartNumber, err}
+
+			// Try and get the partNumber if available
+			job.done <- response{output: result, err: err, partNumber: job.input.(*s3.UploadPartCopyInput).PartNumber}
 		}(job)
 	}
 	m.uploaderDone <- true
